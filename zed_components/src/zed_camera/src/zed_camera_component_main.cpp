@@ -3789,8 +3789,14 @@ void ZedCamera::initThreads()
   }
   // <---- Start CMOS Temperatures thread
 
+  const bool sensor_outputs_enabled =
+    mPublishSensImu || mPublishSensImuRaw || mPublishSensImuTransf ||
+    mPublishSensMag || mPublishSensBaro || mPublishSensTemp || mPublishImuTF;
+
   // ----> Start Sensors thread if not sync
-  if (!mSensCameraSync && !sl_tools::isZED(mCamRealModel)) {
+  if (!mSensCameraSync && !sl_tools::isZED(mCamRealModel) &&
+    sensor_outputs_enabled)
+  {
     mSensThread = std::thread(&ZedCamera::threadFunc_pubSensorsData, this);
   }
   // <---- Start Sensors thread if not sync
