@@ -410,7 +410,7 @@ private:
   uint32_t mSvoLoopCount = 0;
 
   // ----> Topics
-  std::string mTopicRoot = "~/";
+  std::string mTopicRoot = "";
 
   // Image Topics
   std::string mLeftTopic;

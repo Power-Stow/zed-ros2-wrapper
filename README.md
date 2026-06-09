@@ -134,6 +134,8 @@ Launch options:
 - [Optional] `sim_address`: set the address of the simulation server. The default is `127.0.0.1`, and it's valid if the node runs on the same machine as the simulator.
 - [Optional] `sim_port`: set the port of the simulation server. It must match the value of the field `Streaming Port` of the properties of the `ZED camera streamer` Action Graph node. A different `Streaming Port` value for each camera is required in multi-camera simulations.
 
+When sensor outputs such as IMU, magnetometer, barometer, temperature, or IMU TF are disabled, the wrapper skips sensor polling so simulation backends that provide only image/depth streams do not spam `getSensorsData` warnings.
+
 You can also start a preconfigured instance of `rviz2` to visualize all the information available in the simulation by using the command:
 
 ```bash

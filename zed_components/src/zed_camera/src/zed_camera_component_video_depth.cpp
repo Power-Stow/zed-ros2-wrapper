@@ -2979,8 +2979,12 @@ void ZedCamera::handleVideoDepthPublishing()
   rclcpp::Time pub_ts;
   publishVideoDepth(pub_ts);
 
+  const bool sensor_outputs_enabled =
+    mPublishSensImu || mPublishSensImuRaw || mPublishSensImuTransf ||
+    mPublishSensMag || mPublishSensBaro || mPublishSensTemp || mPublishImuTF;
+
   // ----> Publish sync sensors data if needed
-  if (mSensCameraSync) {
+  if (mSensCameraSync && sensor_outputs_enabled) {
     if (!sl_tools::isZED(mCamRealModel) && mVdPublishing &&
       pub_ts != TIMEZERO_ROS)
     {
