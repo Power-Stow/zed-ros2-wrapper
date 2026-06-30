@@ -275,7 +275,7 @@ protected:
     camInfoMsgPtr & camInfoMsg, const rclcpp::Time & t);
 
   void publishDepthMapWithInfo(const sl::Mat & depth, const rclcpp::Time & t);
-  void publishDisparity(const sl::Mat & disparity, const rclcpp::Time & t);
+  void publishDisparityMap(const sl::Mat & disparity, const rclcpp::Time & t);
 
   void processVideoDepth();
   bool updateVideoDepthSubscribers(bool force = false);
@@ -291,7 +291,7 @@ protected:
   bool retrieveRightRawGrayImage(bool gpu);
   bool retrieveDepthMap(bool gpu);
   bool retrieveConfidence(bool gpu);
-  bool retrieveDisparity();
+  bool retrieveDisparityMap();
   bool retrieveDepthInfo();
 
   void publishVideoDepth(rclcpp::Time & out_pub_ts);
@@ -307,7 +307,7 @@ protected:
   void publishStereoRawImages(const rclcpp::Time & t);
   void publishDepthImage(const rclcpp::Time & t);
   void publishConfidenceMap(const rclcpp::Time & t);
-  void publishDisparityImage(const rclcpp::Time & t);
+  void publishDisparity(const rclcpp::Time & t);
   void publishDepthInfo(const rclcpp::Time & t);
   void publishCameraInfos(); // Used to publish camera infos when no video/depth is subscribed
 
@@ -316,6 +316,9 @@ protected:
 
   void processPointCloud();
   bool isPointCloudSubscribed();
+  // Configures the reusable point cloud message (fields/size) for the given
+  // resolution. Returns true if the buffer was (re)allocated this call.
+  bool prepareCloudMsg(size_t width, size_t height);
   void publishPointCloud();
   void publishImuFrameAndTopic();
 
@@ -359,6 +362,8 @@ protected:
   void applyZEDXAutoAnalogGainRange();
   void applyZEDXAutoDigitalGainRange();
   void applyZEDXDenoising();
+  void applyZEDXAEAntibanding();
+  void readSceneIlluminance();
 
   void applyDepthSettings();
 
@@ -429,7 +434,9 @@ private:
   std::string mRgbRawGrayTopic;
 
   // Depth Topics
-  std::string mDisparityTopic;
+  std::string mDisparityTopic; // Obbsolete
+  std::string mDispMapTopic;
+  std::string mDispImgTopic;
   std::string mDepthTopic;
   std::string mDepthInfoTopic;
   std::string mConfMapTopic;
@@ -543,6 +550,7 @@ private:
   double mSvoExpectedPeriod = 0.0;
   bool mUseSvoTimestamp = false;
   bool mUsePubTimestamps = false;
+  bool mUseSdkMonotonicClock = false;
   bool mGrabOnce = false;
   bool mGrabImuOnce = false;
   int mVerbose = 1;
@@ -726,6 +734,8 @@ private:
   int mGmslAutoDigitalGainRangeMin = 1;
   int mGmslAutoDigitalGainRangeMax = 256;
   int mGmslDenoising = 50;
+  int mGmslAEAntibanding = 1;  // 0=OFF, 1=AUTO, 2=50Hz, 3=60Hz
+  int mSceneIlluminance = -1;  // Read-only, populated from SDK getCameraSettings
   // <---- Dynamic params
 
   // ----> QoS
@@ -880,6 +890,7 @@ private:
   nitrosImgPub mNitrosPubRoiMask;
   nitrosImgPub mNitrosPubDepth;
   nitrosImgPub mNitrosPubConfMap;
+  nitrosImgPub mNitrosPubDispImg;
 #endif
 
   // Image publishers without camera info (no NITROS)
@@ -902,6 +913,7 @@ private:
   camInfoPub mPubRoiMaskCamInfo;
   camInfoPub mPubDepthCamInfo;
   camInfoPub mPubConfMapCamInfo;
+  camInfoPub mPubDispImgCamInfo;
   camInfoPub mPubRgbCamInfoTrans;
   camInfoPub mPubRawRgbCamInfoTrans;
   camInfoPub mPubLeftCamInfoTrans;
@@ -917,6 +929,7 @@ private:
   camInfoPub mPubRoiMaskCamInfoTrans;
   camInfoPub mPubDepthCamInfoTrans;
   camInfoPub mPubConfMapCamInfoTrans;
+  camInfoPub mPubDispImgCamInfoTrans;
 
 #ifdef FOUND_POINT_CLOUD_TRANSPORT
   point_cloud_transport::Publisher mPubCloud;
@@ -931,7 +944,13 @@ private:
   svoStatusPub mPubSvoStatus;
   healthStatusPub mPubHealthStatus;
   heartbeatStatusPub mPubHeartbeatStatus;
-  disparityPub mPubDisparity;
+
+  disparityPub mPubDisparity; // Obsolete
+  disparityPub mPubDispMap; // Disparity Map
+  image_transport::Publisher mPubDispImg; // Disparity Image
+  adaptedImagePub mPubIpcDispImg; // Disparity Image for IPC
+
+
   posePub mPubPose;
   poseStatusPub mPubPoseStatus;
   poseCovPub mPubPoseCov;
@@ -979,7 +998,9 @@ private:
   size_t mStereoRawSubCount = 0;
   size_t mDepthSubCount = 0;
   size_t mConfMapSubCount = 0;
-  size_t mDisparitySubCount = 0;
+  size_t mDisparitySubCount = 0; // Obsolete
+  size_t mDispMapSubCount = 0;
+  size_t mDispImgSubCount = 0;
   size_t mDepthInfoSubCount = 0;
   size_t mPcSubCount = 0;
   std::chrono::steady_clock::time_point mLastVideoDepthSubCountQuery;
@@ -992,7 +1013,7 @@ private:
   sl::Mat mMatRight, mMatRightRaw;
   sl::Mat mMatLeftGray, mMatLeftRawGray;
   sl::Mat mMatRightGray, mMatRightRawGray;
-  sl::Mat mMatDepth, mMatDisp, mMatConf;
+  sl::Mat mMatDepth, mMatDispMap, mMatDispImg, mMatConf;
 
   float mMinDepth = 0.0f;
   float mMaxDepth = 0.0f;
@@ -1185,6 +1206,9 @@ private:
   unsigned int mSvoRecFramerate = 0;
   bool mSvoRecTranscode = false;
   std::string mSvoRecFilename;
+#if (ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) >= 53
+  sl::SVO_ENCODING_PRESET mSvoRecEncodingPreset = sl::SVO_ENCODING_PRESET::DEFAULT;
+#endif
   // <---- SVO Recording parameters
 
   // ----> Services
