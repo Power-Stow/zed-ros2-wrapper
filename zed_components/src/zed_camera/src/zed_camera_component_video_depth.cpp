@@ -17,7 +17,6 @@
 #include "sl_tools.hpp"
 
 #include <mutex>
-#include <sensor_msgs/distortion_models.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
@@ -79,6 +78,7 @@ void ZedCamera::initVideoDepthPublishers()
   mDispMapTopic = mTopicRoot + "disparity/map";
   mDispImgTopic = mTopicRoot + "disparity/image";
   mDepthTopic = mTopicRoot + "depth/depth_registered";
+  mDepthImageTopic = mTopicRoot + "image/depth_image";
   mDepthInfoTopic = mTopicRoot + "depth/depth_info";
   mConfMapTopic = mTopicRoot + "confidence/confidence_map";
   mPointcloudTopic = mTopicRoot + "point_cloud/cloud_registered";
@@ -89,6 +89,7 @@ void ZedCamera::initVideoDepthPublishers()
   mDispMapTopic = get_node_topics_interface()->resolve_topic_name(mDispMapTopic);
   mDispImgTopic = get_node_topics_interface()->resolve_topic_name(mDispImgTopic);
   mDepthTopic = get_node_topics_interface()->resolve_topic_name(mDepthTopic);
+  mDepthImageTopic = get_node_topics_interface()->resolve_topic_name(mDepthImageTopic);
   mDepthInfoTopic = get_node_topics_interface()->resolve_topic_name(mDepthInfoTopic);
   mConfMapTopic = get_node_topics_interface()->resolve_topic_name(mConfMapTopic);
   mPointcloudTopic = get_node_topics_interface()->resolve_topic_name(mPointcloudTopic);
@@ -103,7 +104,7 @@ void ZedCamera::initVideoDepthPublishers()
   // Camera publishers
   if (_nitrosDisabled) {
 
-    // Publishers logging — reads back the actual enabled plugins for this topic
+    // Publishers logging: reads back the actual enabled plugins for this topic
     auto log_cam_pub = [&](const auto & pub) {
         RCLCPP_INFO_STREAM(
           get_logger(),
@@ -191,7 +192,7 @@ void ZedCamera::initVideoDepthPublishers()
                 allowed.push_back(t);
               }
             } else {
-              // Unknown plugin (e.g. zstd) — allow for all types
+              // Unknown plugin (e.g. zstd): allow for all types
               allowed.push_back(t);
             }
           }
@@ -202,7 +203,7 @@ void ZedCamera::initVideoDepthPublishers()
         if (allowed.empty()) {
           RCLCPP_WARN(
             get_logger(),
-            "No compatible transports found for topic %s — falling back to all plugins",
+            "No compatible transports found for topic %s, falling back to all plugins",
             topic.c_str());
           return;
         }
@@ -215,7 +216,7 @@ void ZedCamera::initVideoDepthPublishers()
             if (t.find("/raw") != std::string::npos) {
               RCLCPP_WARN(
                 get_logger(),
-                "Raw transport enabled via parameter override — "
+                "Raw transport enabled via parameter override: "
                 "this may cause duplicate messages on topic: %s", topic.c_str());
             }
           }
@@ -278,6 +279,9 @@ void ZedCamera::initVideoDepthPublishers()
       }
       if (mPublishDepthMap) {
         create_dual_pub(mDepthTopic, mPubIpcDepth, mPubDepth, ImageTopicType::MEASURE);
+      }
+      if (mPublishDepthImage) {
+        create_dual_pub(mDepthImageTopic, mPubIpcDepthImage, mPubDepthImage);
       }
       if (mPublishConfidence) {
         create_dual_pub(mConfMapTopic, mPubIpcConfMap, mPubConfMap, ImageTopicType::MEASURE);
@@ -345,6 +349,9 @@ void ZedCamera::initVideoDepthPublishers()
         nvidia::isaac_ros::nitros::NitrosDiagnosticsConfig(), mQos);
       RCLCPP_INFO_STREAM(get_logger(), " * Advertised on topic: " << mDepthTopic);
       RCLCPP_INFO_STREAM(get_logger(), " * Advertised on topic: " << mDepthTopic + "/nitros");
+    }
+    if (mPublishDepthImage) {
+      mNitrosPubDepthImage = make_nitros_img_pub(mDepthImageTopic);
     }
     if (mPublishConfidence) {
       mNitrosPubConfMap = make_nitros_img_pub(mConfMapTopic);
@@ -419,6 +426,10 @@ void ZedCamera::initVideoDepthPublishers()
   if (mPublishDepthMap) {
     mPubDepthCamInfo = make_cam_info_pub(mDepthTopic);
     mPubDepthCamInfoTrans = make_cam_info_trans_pub(mDepthTopic);
+  }
+  if (mPublishDepthImage) {
+    mPubDepthImageCamInfo = make_cam_info_pub(mDepthImageTopic);
+    mPubDepthImageCamInfoTrans = make_cam_info_trans_pub(mDepthImageTopic);
   }
   if (mPublishConfidence) {
     mPubConfMapCamInfo = make_cam_info_pub(mConfMapTopic);
@@ -645,6 +656,39 @@ void ZedCamera::getDepthParams()
   }
 
   if (!mDepthDisabled) {
+#if (ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) >= 55
+    sl_tools::getEnumParam(
+      shared_from_this(), "depth.depth_precision", "FP16",
+      sl::DEPTH_PRECISION::FP16,
+      sl::DEPTH_PRECISION::LAST, mDepthPrecision,
+      " * Depth precision: ");
+    if (mDepthPrecision == sl::DEPTH_PRECISION::INT8 &&
+      mDepthMode != sl::DEPTH_MODE::NEURAL)
+    {
+      RCLCPP_WARN_STREAM(
+        get_logger(),
+        "'depth.depth_precision' is set to 'INT8', but only 'NEURAL' provides an INT8 model. "
+        "The ZED SDK will fall back to 'FP16' with the current 'depth.depth_mode' value: "
+          << sl::toString(mDepthMode).c_str());
+    }
+
+    sl_tools::getParam(
+      shared_from_this(), "depth.allow_depth_cuda_graph",
+      mAllowDepthCudaGraph, mAllowDepthCudaGraph,
+      " * Allow depth CUDA Graph: ");
+    if (mAllowDepthCudaGraph &&
+      mDepthMode != sl::DEPTH_MODE::NEURAL_LIGHT &&
+      mDepthMode != sl::DEPTH_MODE::NEURAL &&
+      mDepthMode != sl::DEPTH_MODE::NEURAL_PLUS)
+    {
+      RCLCPP_WARN_STREAM(
+        get_logger(),
+        "'depth.allow_depth_cuda_graph' is enabled, but the CUDA Graph is only used by the "
+        "'NEURAL' depth mode family. It will be ignored with the current 'depth.depth_mode' "
+        "value: " << sl::toString(mDepthMode).c_str());
+    }
+#endif
+
 #if ((ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) < 51)
     const double default_min_depth = 0.1;
 #else
@@ -779,102 +823,11 @@ void ZedCamera::fillCamInfo(
   float baseline = zedParam.getCameraBaseline();
 
   // ----> Distortion models
-  // ZED SDK params order: [ k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4]
-  // Radial (k1, k2, k3, k4, k5, k6), Tangential (p1,p2) and Prism (s1, s2, s3,
-  // s4) distortion. Prism not currently used.
-
-  // ROS2 order (OpenCV) -> k1,k2,p1,p2,k3,k4,k5,k6,s1,s2,s3,s4
-  switch (mCamRealModel) {
-    case sl::MODEL::ZED:  // PLUMB_BOB
-      leftCamInfoMsg->distortion_model =
-        sensor_msgs::distortion_models::PLUMB_BOB;
-      rightCamInfoMsg->distortion_model =
-        sensor_msgs::distortion_models::PLUMB_BOB;
-      leftCamInfoMsg->d.resize(5);
-      rightCamInfoMsg->d.resize(5);
-      leftCamInfoMsg->d[0] = zedParam.left_cam.disto[0];    // k1
-      leftCamInfoMsg->d[1] = zedParam.left_cam.disto[1];    // k2
-      leftCamInfoMsg->d[2] = zedParam.left_cam.disto[2];    // p1
-      leftCamInfoMsg->d[3] = zedParam.left_cam.disto[3];    // p2
-      leftCamInfoMsg->d[4] = zedParam.left_cam.disto[4];    // k3
-      rightCamInfoMsg->d[0] = zedParam.right_cam.disto[0];  // k1
-      rightCamInfoMsg->d[1] = zedParam.right_cam.disto[1];  // k2
-      rightCamInfoMsg->d[2] = zedParam.right_cam.disto[2];  // p1
-      rightCamInfoMsg->d[3] = zedParam.right_cam.disto[3];  // p2
-      rightCamInfoMsg->d[4] = zedParam.right_cam.disto[4];  // k3
-      break;
-
-    case sl::MODEL::ZED2:    // RATIONAL_POLYNOMIAL
-    case sl::MODEL::ZED2i:   // RATIONAL_POLYNOMIAL
-    case sl::MODEL::ZED_X:   // RATIONAL_POLYNOMIAL
-    case sl::MODEL::ZED_XM:  // RATIONAL_POLYNOMIAL
-#if (ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) >= 53
-    case sl::MODEL::ZED_X_NANO:  // RATIONAL_POLYNOMIAL
-#endif
-    case sl::MODEL::VIRTUAL_ZED_X:  // RATIONAL_POLYNOMIAL
-      leftCamInfoMsg->distortion_model =
-        sensor_msgs::distortion_models::RATIONAL_POLYNOMIAL;
-      rightCamInfoMsg->distortion_model =
-        sensor_msgs::distortion_models::RATIONAL_POLYNOMIAL;
-      leftCamInfoMsg->d.resize(8);
-      rightCamInfoMsg->d.resize(8);
-      leftCamInfoMsg->d[0] = zedParam.left_cam.disto[0];    // k1
-      leftCamInfoMsg->d[1] = zedParam.left_cam.disto[1];    // k2
-      leftCamInfoMsg->d[2] = zedParam.left_cam.disto[2];    // p1
-      leftCamInfoMsg->d[3] = zedParam.left_cam.disto[3];    // p2
-      leftCamInfoMsg->d[4] = zedParam.left_cam.disto[4];    // k3
-      leftCamInfoMsg->d[5] = zedParam.left_cam.disto[5];    // k4
-      leftCamInfoMsg->d[6] = zedParam.left_cam.disto[6];    // k5
-      leftCamInfoMsg->d[7] = zedParam.left_cam.disto[7];    // k6
-      rightCamInfoMsg->d[0] = zedParam.right_cam.disto[0];  // k1
-      rightCamInfoMsg->d[1] = zedParam.right_cam.disto[1];  // k2
-      rightCamInfoMsg->d[2] = zedParam.right_cam.disto[2];  // p1
-      rightCamInfoMsg->d[3] = zedParam.right_cam.disto[3];  // p2
-      rightCamInfoMsg->d[4] = zedParam.right_cam.disto[4];  // k3
-      rightCamInfoMsg->d[5] = zedParam.right_cam.disto[5];  // k4
-      rightCamInfoMsg->d[6] = zedParam.right_cam.disto[6];  // k5
-      rightCamInfoMsg->d[7] = zedParam.right_cam.disto[7];  // k6
-      break;
-
-    case sl::MODEL::ZED_M:
-      if (zedParam.left_cam.disto[5] != 0 &&   // k4!=0
-        zedParam.right_cam.disto[2] == 0 &&    // p1==0
-        zedParam.right_cam.disto[3] == 0)      // p2==0
-      {
-        leftCamInfoMsg->distortion_model =
-          sensor_msgs::distortion_models::EQUIDISTANT;
-        rightCamInfoMsg->distortion_model =
-          sensor_msgs::distortion_models::EQUIDISTANT;
-
-        leftCamInfoMsg->d.resize(4);
-        rightCamInfoMsg->d.resize(4);
-        leftCamInfoMsg->d[0] = zedParam.left_cam.disto[0];    // k1
-        leftCamInfoMsg->d[1] = zedParam.left_cam.disto[1];    // k2
-        leftCamInfoMsg->d[2] = zedParam.left_cam.disto[4];    // k3
-        leftCamInfoMsg->d[3] = zedParam.left_cam.disto[5];    // k4
-        rightCamInfoMsg->d[0] = zedParam.right_cam.disto[0];  // k1
-        rightCamInfoMsg->d[1] = zedParam.right_cam.disto[1];  // k2
-        rightCamInfoMsg->d[2] = zedParam.right_cam.disto[4];  // k3
-        rightCamInfoMsg->d[3] = zedParam.right_cam.disto[5];  // k4
-      } else {
-        leftCamInfoMsg->distortion_model =
-          sensor_msgs::distortion_models::PLUMB_BOB;
-        rightCamInfoMsg->distortion_model =
-          sensor_msgs::distortion_models::PLUMB_BOB;
-        leftCamInfoMsg->d.resize(5);
-        rightCamInfoMsg->d.resize(5);
-        leftCamInfoMsg->d[0] = zedParam.left_cam.disto[0];    // k1
-        leftCamInfoMsg->d[1] = zedParam.left_cam.disto[1];    // k2
-        leftCamInfoMsg->d[2] = zedParam.left_cam.disto[2];    // p1
-        leftCamInfoMsg->d[3] = zedParam.left_cam.disto[3];    // p2
-        leftCamInfoMsg->d[4] = zedParam.left_cam.disto[4];    // k3
-        rightCamInfoMsg->d[0] = zedParam.right_cam.disto[0];  // k1
-        rightCamInfoMsg->d[1] = zedParam.right_cam.disto[1];  // k2
-        rightCamInfoMsg->d[2] = zedParam.right_cam.disto[2];  // p1
-        rightCamInfoMsg->d[3] = zedParam.right_cam.disto[3];  // p2
-        rightCamInfoMsg->d[4] = zedParam.right_cam.disto[4];  // k3
-      }
-  }
+  // Taken from the model reported by the ZED SDK for these calibration
+  // parameters, not guessed from the camera model: the lens decides it.
+  sl_tools::fillCamInfoDistortion(zedParam.left_cam, *leftCamInfoMsg);
+  sl_tools::fillCamInfoDistortion(zedParam.right_cam, *rightCamInfoMsg);
+  // <---- Distortion models
 
   leftCamInfoMsg->k.fill(0.0);
   rightCamInfoMsg->k.fill(0.0);
@@ -939,7 +892,7 @@ bool ZedCamera::areVideoDepthSubscribed()
     mLeftSubCount + mLeftRawSubCount + mLeftGraySubCount + mLeftGrayRawSubCount +
     mRightSubCount + mRightRawSubCount + mRightGraySubCount + mRightGrayRawSubCount +
     mStereoSubCount + mStereoRawSubCount +
-    mDepthSubCount + mConfMapSubCount + mDisparitySubCount +
+    mDepthSubCount + mDepthImageSubCount + mConfMapSubCount + mDisparitySubCount +
     mDispMapSubCount + mDispImgSubCount + mDepthInfoSubCount
   ) > 0;
 }
@@ -973,6 +926,7 @@ bool ZedCamera::updateVideoDepthSubscribers(bool force)
   mStereoSubCount = 0;
   mStereoRawSubCount = 0;
   mDepthSubCount = 0;
+  mDepthImageSubCount = 0;
   mConfMapSubCount = 0;
   mDisparitySubCount = 0;
   mDispMapSubCount = 0;
@@ -1058,6 +1012,10 @@ bool ZedCamera::updateVideoDepthSubscribers(bool force)
         if (mPublishDepthMap) {
           mDepthSubCount = mPubDepth.getNumSubscribers() + ipc_sub_count(mPubIpcDepth);
         }
+        if (mPublishDepthImage) {
+          mDepthImageSubCount = mPubDepthImage.getNumSubscribers() +
+            ipc_sub_count(mPubIpcDepthImage);
+        }
         if (mPublishConfidence) {
           mConfMapSubCount = mPubConfMap.getNumSubscribers() + ipc_sub_count(mPubIpcConfMap);
         }
@@ -1068,6 +1026,8 @@ bool ZedCamera::updateVideoDepthSubscribers(bool force)
 #ifdef FOUND_ISAAC_ROS_NITROS
         mDepthSubCount = count_subscribers(mDepthTopic) + count_subscribers(
           mDepthTopic + "/nitros");
+        mDepthImageSubCount = count_subscribers(mDepthImageTopic) + count_subscribers(
+          mDepthImageTopic + "/nitros");
         mConfMapSubCount = count_subscribers(mConfMapTopic) + count_subscribers(
           mConfMapTopic + "/nitros");
         mDispImgSubCount = count_subscribers(mDispImgTopic) + count_subscribers(
@@ -1075,20 +1035,20 @@ bool ZedCamera::updateVideoDepthSubscribers(bool force)
 #endif
       }
       if (mPubDepthInfo) {
-        mDepthInfoSubCount = count_subscribers(mPubDepthInfo->get_topic_name());
+        mDepthInfoSubCount = mPubDepthInfo->get_subscription_count();
       }
       if (mPubDisparity) {
-        mDisparitySubCount = count_subscribers(mPubDisparity->get_topic_name());
+        mDisparitySubCount = mPubDisparity->get_subscription_count();
       }
       if (mPubDispMap) {
-        mDispMapSubCount = count_subscribers(mPubDispMap->get_topic_name());
+        mDispMapSubCount = mPubDispMap->get_subscription_count();
       }
 
 #ifdef FOUND_POINT_CLOUD_TRANSPORT
       mPcSubCount = mPubCloud.getNumSubscribers();
 #else
       if (mPubCloud) {
-        mPcSubCount = count_subscribers(mPubCloud->get_topic_name());
+        mPcSubCount = mPubCloud->get_subscription_count();
       }
 #endif
     }
@@ -1115,7 +1075,8 @@ bool ZedCamera::isDepthRequired()
   }
 
   size_t tot_sub =
-    mDepthSubCount + mConfMapSubCount + mDisparitySubCount + mDispImgSubCount + mDispMapSubCount +
+    mDepthSubCount + mDepthImageSubCount + mConfMapSubCount + mDisparitySubCount +
+    mDispImgSubCount + mDispMapSubCount +
     mPcSubCount +
     mDepthInfoSubCount;
 
@@ -1161,6 +1122,10 @@ void ZedCamera::applyVideoSettings()
   if (!mSvoMode && mCamSettingsDirty && mFrameCount % 10 == 0) {
     std::lock_guard<std::mutex> lock(mDynParMutex);
 
+    // Assume success; each helper sets this to false if a setting could not
+    // be applied to the camera.
+    mVideoSettingsApplyOk = true;
+
     applyAutoExposureGainSettings();
     applyExposureGainSettings();
     applyWhiteBalanceSettings();
@@ -1168,8 +1133,53 @@ void ZedCamera::applyVideoSettings()
     applySaturationSharpnessGammaSettings();
     applyZEDXSettings();
 
-    mCamSettingsDirty = false;
+    // Only stop re-applying once every setting has been successfully pushed to
+    // the camera. The ZED SDK keeps the last video settings in the camera's
+    // volatile memory across open/close, so if we cleared this flag after a
+    // failed/skipped apply (e.g. a transient read error at start-up, or USB
+    // bandwidth contention when several cameras open at once) the camera would
+    // silently keep the values left by the previous application (e.g. ZED
+    // Explorer) for the whole session.
+    if (mVideoSettingsApplyOk) {
+      mCamSettingsDirty = false;
+      mVideoSettingsRetryCount = 0;
+    } else if (++mVideoSettingsRetryCount >= mVideoSettingsMaxRetries) {
+      // Bound the retries so a setting that is genuinely unsupported on this
+      // camera model does not keep retrying (and logging) forever.
+      RCLCPP_WARN(
+        get_logger(),
+        "Some video settings could not be applied after %d attempts; "
+        "giving up until the next parameter change.",
+        mVideoSettingsMaxRetries);
+      mCamSettingsDirty = false;
+      mVideoSettingsRetryCount = 0;
+    }
   }
+}
+
+// Helper: robustly enforce a single integer video setting.
+bool ZedCamera::applyVideoSetting(sl::VIDEO_SETTINGS setting, int value)
+{
+  int current = 0;
+  sl::ERROR_CODE err = mZed->getCameraSettings(setting, current);
+
+  // Write when we could not read the current value (read failed) OR it differs
+  // from the requested one. A failed read must NOT suppress the write:
+  // otherwise the configured value would never reach the camera and the stale
+  // value persisted from a previous application would remain in effect.
+  if (err != sl::ERROR_CODE::SUCCESS || current != value) {
+    err = mZed->setCameraSettings(setting, value);
+    if (err != sl::ERROR_CODE::SUCCESS) {
+      RCLCPP_WARN_STREAM(
+        get_logger(),
+        "Error setting " << sl::toString(setting).c_str() << ": "
+                         << sl::toString(err).c_str());
+      return false;
+    }
+    DEBUG_STREAM_CTRL(
+      "New setting for " << sl::toString(setting).c_str() << ": " << value);
+  }
+  return true;
 }
 
 // Helper: Auto Exposure/Gain
@@ -1185,6 +1195,7 @@ void ZedCamera::applyAutoExposureGainSettings()
       RCLCPP_WARN_STREAM(
         get_logger(), "Error setting AEC_AGC: "
           << sl::toString(err).c_str());
+      mVideoSettingsApplyOk = false;
     } else {
       mTriggerAutoExpGain = false;
       DEBUG_STREAM_CTRL(
@@ -1198,36 +1209,11 @@ void ZedCamera::applyAutoExposureGainSettings()
 // Helper: Exposure and Gain
 void ZedCamera::applyExposureGainSettings()
 {
-  sl::ERROR_CODE err;
-  sl::VIDEO_SETTINGS setting;
-
   if (!mCamAutoExpGain) {
-    int value;
-    err = mZed->getCameraSettings(sl::VIDEO_SETTINGS::EXPOSURE, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mCamExposure) {
-      mZed->setCameraSettings(sl::VIDEO_SETTINGS::EXPOSURE, mCamExposure);
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(),
-        "Error setting "
-          << sl::toString(sl::VIDEO_SETTINGS::EXPOSURE).c_str() << ": "
-          << sl::toString(err).c_str());
-    }
-
-    err = mZed->getCameraSettings(sl::VIDEO_SETTINGS::GAIN, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mCamGain) {
-      err = mZed->setCameraSettings(sl::VIDEO_SETTINGS::GAIN, mCamGain);
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(),
-        "Error setting "
-          << sl::toString(sl::VIDEO_SETTINGS::GAIN).c_str()
-          << ": " << sl::toString(err).c_str());
-    }
+    mVideoSettingsApplyOk &=
+      applyVideoSetting(sl::VIDEO_SETTINGS::EXPOSURE, mCamExposure);
+    mVideoSettingsApplyOk &=
+      applyVideoSetting(sl::VIDEO_SETTINGS::GAIN, mCamGain);
   }
 }
 
@@ -1246,6 +1232,7 @@ void ZedCamera::applyWhiteBalanceSettings()
           << sl::toString(setting).c_str()
           << ": "
           << sl::toString(err).c_str());
+      mVideoSettingsApplyOk = false;
     } else {
       mTriggerAutoWB = false;
       DEBUG_STREAM_CTRL(
@@ -1255,20 +1242,8 @@ void ZedCamera::applyWhiteBalanceSettings()
   }
 
   if (!mCamAutoWB) {
-    int value;
-    setting = sl::VIDEO_SETTINGS::WHITEBALANCE_TEMPERATURE;
-    err = mZed->getCameraSettings(setting, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mCamWBTemp) {
-      err = mZed->setCameraSettings(setting, mCamWBTemp);
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(), "Error setting "
-          << sl::toString(setting).c_str()
-          << ": "
-          << sl::toString(err).c_str());
-    }
+    mVideoSettingsApplyOk &= applyVideoSetting(
+      sl::VIDEO_SETTINGS::WHITEBALANCE_TEMPERATURE, mCamWBTemp);
   }
 }
 
@@ -1276,99 +1251,24 @@ void ZedCamera::applyWhiteBalanceSettings()
 void ZedCamera::applyBrightnessContrastHueSettings()
 {
   if (!sl_tools::isZEDX(mCamRealModel)) {
-    sl::ERROR_CODE err;
-    sl::VIDEO_SETTINGS setting;
-    int value;
-
-    setting = sl::VIDEO_SETTINGS::BRIGHTNESS;
-    err = mZed->getCameraSettings(setting, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mCamBrightness) {
-      mZed->setCameraSettings(setting, mCamBrightness);
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(), "Error setting "
-          << sl::toString(setting).c_str()
-          << ": "
-          << sl::toString(err).c_str());
-    }
-
-    setting = sl::VIDEO_SETTINGS::CONTRAST;
-    err = mZed->getCameraSettings(setting, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mCamContrast) {
-      err = mZed->setCameraSettings(setting, mCamContrast);
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(), "Error setting "
-          << sl::toString(setting).c_str()
-          << ": "
-          << sl::toString(err).c_str());
-    }
-
-    setting = sl::VIDEO_SETTINGS::HUE;
-    err = mZed->getCameraSettings(setting, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mCamHue) {
-      mZed->setCameraSettings(setting, mCamHue);
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(), "Error setting "
-          << sl::toString(setting).c_str()
-          << ": "
-          << sl::toString(err).c_str());
-    }
+    mVideoSettingsApplyOk &=
+      applyVideoSetting(sl::VIDEO_SETTINGS::BRIGHTNESS, mCamBrightness);
+    mVideoSettingsApplyOk &=
+      applyVideoSetting(sl::VIDEO_SETTINGS::CONTRAST, mCamContrast);
+    mVideoSettingsApplyOk &=
+      applyVideoSetting(sl::VIDEO_SETTINGS::HUE, mCamHue);
   }
 }
 
 // Helper: Saturation, Sharpness, Gamma
 void ZedCamera::applySaturationSharpnessGammaSettings()
 {
-  sl::ERROR_CODE err;
-  sl::VIDEO_SETTINGS setting;
-  int value;
-
-  setting = sl::VIDEO_SETTINGS::SATURATION;
-  err = mZed->getCameraSettings(setting, value);
-  if (err == sl::ERROR_CODE::SUCCESS && value != mCamSaturation) {
-    mZed->setCameraSettings(setting, mCamSaturation);
-  }
-
-  if (err != sl::ERROR_CODE::SUCCESS) {
-    RCLCPP_WARN_STREAM(
-      get_logger(),
-      "Error setting " << sl::toString(setting).c_str()
-                       << ": " << sl::toString(err).c_str());
-  }
-
-  setting = sl::VIDEO_SETTINGS::SHARPNESS;
-  err = mZed->getCameraSettings(setting, value);
-  if (err == sl::ERROR_CODE::SUCCESS && value != mCamSharpness) {
-    mZed->setCameraSettings(setting, mCamSharpness);
-  }
-
-  if (err != sl::ERROR_CODE::SUCCESS) {
-    RCLCPP_WARN_STREAM(
-      get_logger(),
-      "Error setting " << sl::toString(setting).c_str()
-                       << ": " << sl::toString(err).c_str());
-  }
-
-  setting = sl::VIDEO_SETTINGS::GAMMA;
-  err = mZed->getCameraSettings(setting, value);
-  if (err == sl::ERROR_CODE::SUCCESS && value != mCamGamma) {
-    err = mZed->setCameraSettings(setting, mCamGamma);
-  }
-
-  if (err != sl::ERROR_CODE::SUCCESS) {
-    RCLCPP_WARN_STREAM(
-      get_logger(),
-      "Error setting " << sl::toString(setting).c_str()
-                       << ": " << sl::toString(err).c_str());
-  }
+  mVideoSettingsApplyOk &=
+    applyVideoSetting(sl::VIDEO_SETTINGS::SATURATION, mCamSaturation);
+  mVideoSettingsApplyOk &=
+    applyVideoSetting(sl::VIDEO_SETTINGS::SHARPNESS, mCamSharpness);
+  mVideoSettingsApplyOk &=
+    applyVideoSetting(sl::VIDEO_SETTINGS::GAMMA, mCamGamma);
 }
 
 // Helper: ZED X specific settings
@@ -1387,32 +1287,14 @@ void ZedCamera::applyZEDXSettings()
   applyZEDXDenoising();
 #if (ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) >= 53
   applyZEDXAEAntibanding();
-  readSceneIlluminance();
 #endif
 }
 
 void ZedCamera::applyZEDXExposureSettings()
 {
   if (!mCamAutoExpGain) {
-    sl::ERROR_CODE err;
-    sl::VIDEO_SETTINGS setting = sl::VIDEO_SETTINGS::EXPOSURE_TIME;
-    int value;
-    err = mZed->getCameraSettings(setting, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mGmslExpTime) {
-      err = mZed->setCameraSettings(setting, mGmslExpTime);
-      DEBUG_STREAM_CTRL(
-        "New setting for " << sl::toString(setting).c_str()
-                           << ": " << mGmslExpTime << " [Old "
-                           << value << "]");
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(), "Error setting "
-          << sl::toString(setting).c_str()
-          << ": "
-          << sl::toString(err).c_str());
-    }
+    mVideoSettingsApplyOk &=
+      applyVideoSetting(sl::VIDEO_SETTINGS::EXPOSURE_TIME, mGmslExpTime);
   }
 }
 
@@ -1432,91 +1314,40 @@ void ZedCamera::applyZEDXAutoExposureTimeRange()
   err = mZed->getCameraSettings(
     sl::VIDEO_SETTINGS::AUTO_EXPOSURE_TIME_RANGE,
     value_min, value_max);
-  if (err == sl::ERROR_CODE::SUCCESS &&
-    (value_min != mGmslAutoExpTimeRangeMin ||
-    value_max != mGmslAutoExpTimeRangeMax))
+  if (err != sl::ERROR_CODE::SUCCESS ||
+    value_min != mGmslAutoExpTimeRangeMin ||
+    value_max != mGmslAutoExpTimeRangeMax)
   {
     err = mZed->setCameraSettings(
       sl::VIDEO_SETTINGS::AUTO_EXPOSURE_TIME_RANGE,
       mGmslAutoExpTimeRangeMin, mGmslAutoExpTimeRangeMax);
-  }
-
-  if (err != sl::ERROR_CODE::SUCCESS) {
-    RCLCPP_WARN_STREAM(
-      get_logger(), "Error setting "
-        << sl::toString(
-        sl::VIDEO_SETTINGS::AUTO_EXPOSURE_TIME_RANGE)
-        .c_str()
-        << ": " << sl::toString(err).c_str());
+    if (err != sl::ERROR_CODE::SUCCESS) {
+      RCLCPP_WARN_STREAM(
+        get_logger(), "Error setting "
+          << sl::toString(
+          sl::VIDEO_SETTINGS::AUTO_EXPOSURE_TIME_RANGE)
+          .c_str()
+          << ": " << sl::toString(err).c_str());
+      mVideoSettingsApplyOk = false;
+    }
   }
 }
 
 void ZedCamera::applyZEDXExposureCompensation()
 {
   if (!mStreamMode) {
-    sl::ERROR_CODE err;
-    sl::VIDEO_SETTINGS setting = sl::VIDEO_SETTINGS::EXPOSURE_COMPENSATION;
-    int value;
-    err = mZed->getCameraSettings(setting, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mGmslExposureComp) {
-      err = mZed->setCameraSettings(setting, mGmslExposureComp);
-      DEBUG_STREAM_CTRL(
-        "New setting for " << sl::toString(setting).c_str()
-                           << ": " << mGmslExposureComp
-                           << " [Old " << value << "]");
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(), "Error setting "
-          << sl::toString(setting).c_str()
-          << ": "
-          << sl::toString(err).c_str());
-    }
+    mVideoSettingsApplyOk &= applyVideoSetting(
+      sl::VIDEO_SETTINGS::EXPOSURE_COMPENSATION, mGmslExposureComp);
   }
 }
 
 void ZedCamera::applyZEDXAnalogDigitalGain()
 {
-  sl::ERROR_CODE err;
-  sl::VIDEO_SETTINGS setting = sl::VIDEO_SETTINGS::ANALOG_GAIN;
-
   if (!mCamAutoExpGain) {
-    int value;
-    err = mZed->getCameraSettings(setting, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mGmslAnalogGain) {
-      err = mZed->setCameraSettings(setting, mGmslAnalogGain);
-      DEBUG_STREAM_CTRL(
-        "New setting for " << sl::toString(setting).c_str()
-                           << ": " << mGmslAnalogGain
-                           << " [Old " << value << "]");
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(), "Error setting "
-          << sl::toString(setting).c_str()
-          << ": "
-          << sl::toString(err).c_str());
-    }
-
-    setting = sl::VIDEO_SETTINGS::DIGITAL_GAIN;
-    err = mZed->getCameraSettings(setting, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mGmslDigitalGain) {
-      err = mZed->setCameraSettings(setting, mGmslDigitalGain);
-      DEBUG_STREAM_CTRL(
-        "New setting for " << sl::toString(setting).c_str()
-                           << ": " << mGmslDigitalGain
-                           << " [Old " << value << "]");
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(), "Error setting "
-          << sl::toString(setting).c_str()
-          << ": "
-          << sl::toString(err).c_str());
-    }
+    mVideoSettingsApplyOk &=
+      applyVideoSetting(sl::VIDEO_SETTINGS::ANALOG_GAIN, mGmslAnalogGain);
+    mVideoSettingsApplyOk &=
+      applyVideoSetting(sl::VIDEO_SETTINGS::DIGITAL_GAIN, mGmslDigitalGain);
   }
 }
 
@@ -1536,9 +1367,9 @@ void ZedCamera::applyZEDXAutoAnalogGainRange()
   err = mZed->getCameraSettings(
     sl::VIDEO_SETTINGS::AUTO_ANALOG_GAIN_RANGE,
     value_min, value_max);
-  if (err == sl::ERROR_CODE::SUCCESS &&
-    (value_min != mGmslAnalogGainRangeMin ||
-    value_max != mGmslAnalogGainRangeMax))
+  if (err != sl::ERROR_CODE::SUCCESS ||
+    value_min != mGmslAnalogGainRangeMin ||
+    value_max != mGmslAnalogGainRangeMax)
   {
     err = mZed->setCameraSettings(
       sl::VIDEO_SETTINGS::AUTO_ANALOG_GAIN_RANGE,
@@ -1552,17 +1383,8 @@ void ZedCamera::applyZEDXAutoAnalogGainRange()
           << sl::toString(sl::VIDEO_SETTINGS::AUTO_ANALOG_GAIN_RANGE)
           .c_str()
           << ": " << sl::toString(err).c_str());
+      mVideoSettingsApplyOk = false;
     }
-  }
-
-  if (err != sl::ERROR_CODE::SUCCESS) {
-    RCLCPP_WARN_STREAM(
-      get_logger(),
-      "Error setting "
-        << sl::toString(
-        sl::VIDEO_SETTINGS::AUTO_ANALOG_GAIN_RANGE)
-        .c_str()
-        << ": " << sl::toString(err).c_str());
   }
 }
 
@@ -1582,49 +1404,32 @@ void ZedCamera::applyZEDXAutoDigitalGainRange()
   err = mZed->getCameraSettings(
     sl::VIDEO_SETTINGS::AUTO_DIGITAL_GAIN_RANGE,
     value_min, value_max);
-  if (err == sl::ERROR_CODE::SUCCESS &&
-    (value_min != mGmslAutoDigitalGainRangeMin ||
-    value_max != mGmslAutoDigitalGainRangeMax))
+  if (err != sl::ERROR_CODE::SUCCESS ||
+    value_min != mGmslAutoDigitalGainRangeMin ||
+    value_max != mGmslAutoDigitalGainRangeMax)
   {
     err = mZed->setCameraSettings(
       sl::VIDEO_SETTINGS::AUTO_DIGITAL_GAIN_RANGE,
       mGmslAutoDigitalGainRangeMin,
       mGmslAutoDigitalGainRangeMax);
-  }
-
-  if (err != sl::ERROR_CODE::SUCCESS) {
-    RCLCPP_WARN_STREAM(
-      get_logger(),
-      "Error setting "
-        << sl::toString(
-        sl::VIDEO_SETTINGS::AUTO_DIGITAL_GAIN_RANGE)
-        .c_str()
-        << ": " << sl::toString(err).c_str());
+    if (err != sl::ERROR_CODE::SUCCESS) {
+      RCLCPP_WARN_STREAM(
+        get_logger(),
+        "Error setting "
+          << sl::toString(
+          sl::VIDEO_SETTINGS::AUTO_DIGITAL_GAIN_RANGE)
+          .c_str()
+          << ": " << sl::toString(err).c_str());
+      mVideoSettingsApplyOk = false;
+    }
   }
 }
 
 void ZedCamera::applyZEDXDenoising()
 {
   if (!mStreamMode) {
-    sl::ERROR_CODE err;
-    sl::VIDEO_SETTINGS setting = sl::VIDEO_SETTINGS::DENOISING;
-    int value;
-    err = mZed->getCameraSettings(setting, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mGmslDenoising) {
-      err = mZed->setCameraSettings(setting, mGmslDenoising);
-      DEBUG_STREAM_CTRL(
-        "New setting for " << sl::toString(setting).c_str()
-                           << ": " << mGmslDenoising
-                           << " [Old " << value << "]");
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(), "Error setting "
-          << sl::toString(setting).c_str()
-          << ": "
-          << sl::toString(err).c_str());
-    }
+    mVideoSettingsApplyOk &=
+      applyVideoSetting(sl::VIDEO_SETTINGS::DENOISING, mGmslDenoising);
   }
 }
 
@@ -1632,30 +1437,27 @@ void ZedCamera::applyZEDXDenoising()
 void ZedCamera::applyZEDXAEAntibanding()
 {
   if (!mStreamMode) {
-    sl::ERROR_CODE err;
-    sl::VIDEO_SETTINGS setting = sl::VIDEO_SETTINGS::AE_ANTIBANDING;
-    int value;
-    err = mZed->getCameraSettings(setting, value);
-    if (err == sl::ERROR_CODE::SUCCESS && value != mGmslAEAntibanding) {
-      err = mZed->setCameraSettings(setting, mGmslAEAntibanding);
-      DEBUG_STREAM_CTRL(
-        "New setting for " << sl::toString(setting).c_str()
-                           << ": " << mGmslAEAntibanding
-                           << " [Old " << value << "]");
-    }
-
-    if (err != sl::ERROR_CODE::SUCCESS) {
-      RCLCPP_WARN_STREAM(
-        get_logger(), "Error setting "
-          << sl::toString(setting).c_str()
-          << ": "
-          << sl::toString(err).c_str());
-    }
+    mVideoSettingsApplyOk &=
+      applyVideoSetting(sl::VIDEO_SETTINGS::AE_ANTIBANDING, mGmslAEAntibanding);
   }
 }
 
 void ZedCamera::readSceneIlluminance()
 {
+  // Only GMSL2 (ZED X) cameras expose this metric. Leave mSceneIlluminance at
+  // -1 on every other model, and when there is no live camera to query, so
+  // subscribers can tell "unsupported" from a real reading.
+  if (mSvoMode || mSimMode || !sl_tools::isZEDX(mCamRealModel)) {
+    return;
+  }
+
+  // The scene illuminance is a live measurement, so it must not be tied to the
+  // video settings apply cycle: throttle it on the frame counter instead, the
+  // same way applyVideoSettings() bounds its own camera queries.
+  if (mFrameCount % 10 != 0) {
+    return;
+  }
+
   sl::ERROR_CODE err;
   int value = -1;
   err = mZed->getCameraSettings(sl::VIDEO_SETTINGS::SCENE_ILLUMINANCE, value);
@@ -1724,6 +1526,7 @@ void ZedCamera::retrieveVideoDepth(bool gpu)
 
   DEBUG_STREAM_VD(" *** Retrieving Depth Data ***");
   retrieved_depth |= retrieveDepthMap(gpu);
+  retrieved_depth |= retrieveDepthImage(gpu);
   retrieved_depth |= retrieveConfidence(gpu);
   retrieved_depth |= retrieveDisparityMap();
   retrieved_depth |= retrieveDepthInfo();
@@ -1733,7 +1536,9 @@ void ZedCamera::retrieveVideoDepth(bool gpu)
   }
 
   if (retrieved_video || retrieved_depth) {
-    mSdkGrabTS = mZed->getTimestamp(sl::TIME_REFERENCE::IMAGE);
+    mSdkGrabTS = getFrameSdkTimestamp();
+    // Note: with 'IMAGE_CENTER_OF_EXPOSURE' this latency includes half an exposure
+    // more than with 'IMAGE', since the reference sits earlier in the frame.
     auto now = mZed->getTimestamp(sl::TIME_REFERENCE::CURRENT);
     DEBUG_STREAM_VD(
       " * Video/Depth Latency: " << static_cast<double>(now - mSdkGrabTS) * 1e-9 << " sec");
@@ -1912,6 +1717,28 @@ bool ZedCamera::retrieveDepthMap(bool gpu)
   return false;
 }
 
+bool ZedCamera::retrieveDepthImage(bool gpu)
+{
+  if (mDepthImageSubCount > 0) {
+    DEBUG_STREAM_VD(" * Retrieving Depth image");
+    bool ok = sl::ERROR_CODE::SUCCESS ==
+      mZed->retrieveImage(
+      mMatDepthImage,
+#if (ZED_SDK_MAJOR_VERSION * 10 + ZED_SDK_MINOR_VERSION) >= 51
+      m24bitMode ? sl::VIEW::DEPTH_BGR : sl::VIEW::DEPTH_BGRA,
+#else
+      sl::VIEW::DEPTH,
+#endif
+      gpu ? sl::MEM::GPU : sl::MEM::CPU, mMatResol);
+    if (ok) {
+      DEBUG_STREAM_VD(
+        " * Depth image retrieved into " << (gpu ? "GPU" : "CPU") << " memory");
+    }
+    return ok;
+  }
+  return false;
+}
+
 bool ZedCamera::retrieveDisparityMap()
 {
   if (mDisparitySubCount > 0 || mDispMapSubCount > 0 || mDispImgSubCount > 0) {
@@ -1982,6 +1809,7 @@ void ZedCamera::publishVideoDepth(rclcpp::Time & out_pub_ts)
   publishStereoImages(timeStamp);
   publishStereoRawImages(timeStamp);
   publishDepthImage(timeStamp);
+  publishDepthColorImage(timeStamp);
   publishConfidenceMap(timeStamp);
   publishDisparity(timeStamp);
   publishDepthInfo(timeStamp);
@@ -2384,6 +2212,28 @@ void ZedCamera::publishDepthImage(const rclcpp::Time & t)
   }
 }
 
+void ZedCamera::publishDepthColorImage(const rclcpp::Time & t)
+{
+  if (mDepthImageSubCount > 0) {
+    DEBUG_STREAM_VD(" * mDepthImageSubCount: " << mDepthImageSubCount);
+
+    if (_nitrosDisabled) {
+      publishImageWithInfo(
+        mMatDepthImage, mPubIpcDepthImage, mPubDepthImage, mPubDepthImageCamInfo,
+        mPubDepthImageCamInfoTrans, mLeftCamInfoMsg, mDepthOptFrameId, t);
+    } else {
+#ifdef FOUND_ISAAC_ROS_NITROS
+      publishImageWithInfo(
+        mMatDepthImage, mNitrosPubDepthImage, mPubDepthImageCamInfo, mPubDepthImageCamInfoTrans,
+        mLeftCamInfoMsg, mDepthOptFrameId, t);
+#endif
+    }
+  } else {
+    publishCameraInfo(mPubDepthImageCamInfo, mLeftCamInfoMsg, t);
+    publishCameraInfo(mPubDepthImageCamInfoTrans, mLeftCamInfoMsg, t);
+  }
+}
+
 void ZedCamera::publishConfidenceMap(const rclcpp::Time & t)
 {
   if (mConfMapSubCount > 0) {
@@ -2443,7 +2293,7 @@ void ZedCamera::publishCameraInfo(
   camInfoMsg->header.stamp = ts;
 
   if (infoPub) {
-    if (count_subscribers(infoPub->get_topic_name()) > 0) {
+    if (infoPub->get_subscription_count() > 0) {
       infoPub->publish(*camInfoMsg);
       DEBUG_STREAM_VD(" * Camera Info message published: " << infoPub->get_topic_name());
       DEBUG_STREAM_VD("   * Timestamp: " << ts.nanoseconds() << " nsec");
@@ -2930,7 +2780,7 @@ bool ZedCamera::isPointCloudSubscribed()
     cloudSubCount = mPubCloud.getNumSubscribers();
 #else
     if (mPubCloud) {
-      cloudSubCount = count_subscribers(mPubCloud->get_topic_name());
+      cloudSubCount = mPubCloud->get_subscription_count();
     }
 #endif
   } catch (...) {
@@ -3183,7 +3033,7 @@ bool ZedCamera::waitForVideoDepthData(std::unique_lock<std::mutex> & lock)
 // Helper: Handle publishing and frequency control
 void ZedCamera::handleVideoDepthPublishing()
 {
-  rclcpp::Time pub_ts;
+  rclcpp::Time pub_ts = TIMEZERO_ROS;
   publishVideoDepth(pub_ts);
 
   const bool sensor_outputs_enabled =
@@ -3496,7 +3346,6 @@ bool ZedCamera::handleGmsl2Params(
     }
     mCamSettingsDirty = true;
     DEBUG_STREAM_DYN_PARAMS("Parameter '" << name << "' correctly set to " << val);
-    DEBUG_STREAM_DYN_PARAMS("Parameter '" << name << "' correctly set to " << val);
     return true;
   }
   return false;
@@ -3620,7 +3469,8 @@ bool ZedCamera::handleCommonVideoParams(
       RCLCPP_WARN_STREAM(get_logger(), result.reason);
       return true;
     }
-    if (val <= 0.0) {
+    mVdPubRateAuto = (val <= 0.0);
+    if (mVdPubRateAuto) {
       val = static_cast<double>(mCamGrabFrameRate);
     }
     mVdPubRate = val;
